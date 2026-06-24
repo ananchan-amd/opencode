@@ -37,7 +37,8 @@ export function startRocmBridge(deps: RocmBridgeDeps): { info: PairingInfo; boun
 
   const bridge = new ToolBridge()
   bridge.registerCommand("chat.completion", makeChatHandler(deps))
-  bridge.registerCommand("rocm.telemetry", telemetryHandler)
+  // `rocm.telemetry` is registered automatically by the SDK (real GPU source via rocm-smi where
+  // available, mock otherwise) — we only implement our own command, chat.
 
   const wsPort = port()
   const detail = deps.route.data?.type === "session" ? "session" : "ready"
@@ -159,47 +160,4 @@ async function runChat(deps: RocmBridgeDeps, cmd: RocmCommand): Promise<void> {
       cmd.reply.error(String(err))
     })
   }
-}
-
-// GPU telemetry: shell out to AMD's rocm-smi and stream one line per GPU. Falls back to a single
-// line when rocm-smi isn't installed (e.g. a dev box without ROCm) so the phone never hangs.
-function telemetryHandler(cmd: RocmCommand) {
-  void (async () => {
-    try {
-      const proc = Bun.spawn(["rocm-smi", "--showuse", "--showmemuse", "--showtemp", "--json"], {
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
-      if (code !== 0) {
-        cmd.reply.data(Buffer.from("telemetry unavailable: rocm-smi exited " + code + "\n", "utf8"))
-        cmd.reply.end()
-        return
-      }
-      for (const line of formatTelemetry(stdout)) cmd.reply.data(Buffer.from(line + "\n", "utf8"))
-      cmd.reply.end()
-    } catch {
-      cmd.reply.data(Buffer.from("telemetry unavailable: rocm-smi not found\n", "utf8"))
-      cmd.reply.end()
-    }
-  })()
-}
-
-function formatTelemetry(stdout: string): string[] {
-  try {
-    const data = JSON.parse(stdout) as Record<string, Record<string, string>>
-    const lines: string[] = []
-    for (const [card, fields] of Object.entries(data)) {
-      if (!card.toLowerCase().startsWith("card")) continue
-      const use = fields["GPU use (%)"] ?? fields["GPU use"] ?? "?"
-      const mem = fields["GPU Memory Allocated (VRAM%)"] ?? fields["GPU memory use (%)"] ?? "?"
-      const temp = fields["Temperature (Sensor edge) (C)"] ?? fields["Temperature (Sensor junction) (C)"] ?? "?"
-      lines.push(`${card}: ${use}% util, ${mem}% vram, ${temp}C`)
-    }
-    if (lines.length > 0) return lines
-  } catch {
-    // not JSON — fall through to raw lines
-  }
-  const raw = stdout.split("\n").map((l) => l.trim()).filter(Boolean)
-  return raw.length > 0 ? raw : ["no GPU data"]
 }
