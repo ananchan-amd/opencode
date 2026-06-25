@@ -16,8 +16,9 @@ const QUIET_ZONE = 2
 const DARK = "#000000"
 const LIGHT = "#ffffff"
 
-// Encode two module rows per terminal line with half-block glyphs, so the QR stays roughly square
-// (a full character cell is ~1:2, half-blocks make each module ~1:1).
+// Encode two module rows per terminal line with half-block glyphs, so the QR stays square
+// (a full character cell is ~1:2, half-blocks make each module ~1:1). The code is rendered
+// full-width (no horizontal dialog padding) so the square form fits without wrapping.
 function renderQr(payload: string): string[] {
   const qr = QRCode.create(payload, { errorCorrectionLevel: "M" })
   const size = qr.modules.size
@@ -61,8 +62,8 @@ export function DialogRocmConnect(props: DialogRocmConnectProps) {
   }))
 
   return (
-    <box paddingLeft={2} paddingRight={2} gap={1}>
-      <box flexDirection="row" justifyContent="space-between">
+    <box gap={1}>
+      <box paddingLeft={2} paddingRight={2} flexDirection="row" justifyContent="space-between">
         <text attributes={TextAttributes.BOLD} fg={theme.text}>
           Connect ROCm mobile client
         </text>
@@ -70,14 +71,14 @@ export function DialogRocmConnect(props: DialogRocmConnectProps) {
           esc
         </text>
       </box>
-      <box>
+      <box alignItems="center">
         {lines().map((line) => (
           <text fg={DARK} bg={LIGHT}>
             {line}
           </text>
         ))}
       </box>
-      <box paddingBottom={1}>
+      <box paddingLeft={2} paddingRight={2} paddingBottom={1}>
         <text fg={theme.textMuted}>Scan with the ROCm Bridge app · serving on {props.bound}</text>
         <text fg={theme.textMuted}>Advertising host {props.host}</text>
       </box>
