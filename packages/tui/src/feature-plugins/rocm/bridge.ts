@@ -95,6 +95,9 @@ async function runChat(deps: RocmBridgeDeps, cmd: RocmCommand): Promise<void> {
 
   // Track cumulative text parts and emit only the newly-appended delta per part.
   const sent = new Map<string, number>()
+  // IDs of assistant messages in this session. We only stream assistant text back — without this,
+  // the user's own prompt part (also a `text` part in the session) would echo straight to the phone.
+  const assistantMessages = new Set<string>()
   let activity = false
 
   const handler = (event: GlobalEvent) => {
@@ -104,13 +107,14 @@ async function runChat(deps: RocmBridgeDeps, cmd: RocmCommand): Promise<void> {
     if (ev.type === "message.part.updated") {
       const part = ev.properties.part
       if (part.sessionID !== sessionID) return
+      if (part.type !== "text" || typeof part.text !== "string") return
+      // Skip anything that isn't from an assistant message (e.g. the user's echoed prompt).
+      if (!assistantMessages.has(part.messageID)) return
       activity = true
-      if (part.type === "text" && typeof part.text === "string") {
-        const prev = sent.get(part.id) ?? 0
-        if (part.text.length > prev) {
-          cmd.reply.data(Buffer.from(part.text.slice(prev), "utf8"))
-          sent.set(part.id, part.text.length)
-        }
+      const prev = sent.get(part.id) ?? 0
+      if (part.text.length > prev) {
+        cmd.reply.data(Buffer.from(part.text.slice(prev), "utf8"))
+        sent.set(part.id, part.text.length)
       }
       return
     }
@@ -125,19 +129,18 @@ async function runChat(deps: RocmBridgeDeps, cmd: RocmCommand): Promise<void> {
       return
     }
 
-    // Completion: the assistant message for our session gets a `completed` timestamp. Gate on
-    // having seen activity first, so a stale update for a prior completed message can't end early.
-    if (
-      ev.type === "message.updated" &&
-      ev.properties.sessionID === sessionID &&
-      ev.properties.info.role === "assistant" &&
-      ev.properties.info.time.completed != null &&
-      activity
-    ) {
-      finish(() => {
-        off()
-        cmd.reply.end()
-      })
+    if (ev.type === "message.updated" && ev.properties.sessionID === sessionID) {
+      const info = ev.properties.info
+      if (info.role !== "assistant") return
+      assistantMessages.add(info.id)
+      // Completion: the assistant message gets a `completed` timestamp. Gate on having seen activity
+      // first, so a stale update for a prior completed message can't end the stream early.
+      if (info.time.completed != null && activity) {
+        finish(() => {
+          off()
+          cmd.reply.end()
+        })
+      }
     }
   }
 
