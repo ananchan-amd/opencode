@@ -45,6 +45,8 @@ import { DialogThemeList } from "./component/dialog-theme-list"
 import { DialogHelp } from "./ui/dialog-help"
 import { DialogAgent } from "./component/dialog-agent"
 import { DialogSessionList } from "./component/dialog-session-list"
+import { DialogRocmConnect } from "./component/dialog-rocm-connect"
+import { startRocmBridge } from "./feature-plugins/rocm/bridge"
 import { DialogWorkspaceList } from "./component/dialog-workspace-list"
 import { DialogConsoleOrg } from "./component/dialog-console-org"
 import { ThemeProvider, useTheme } from "./context/theme"
@@ -565,6 +567,20 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         slashAliases: ["resume", "continue"],
         run: () => {
           dialog.replace(() => <DialogSessionList />)
+        },
+      },
+      {
+        name: "rocm.connect",
+        title: "Connect ROCm mobile client",
+        category: "System",
+        slashName: "rocm-connect",
+        run: () => {
+          try {
+            const { info, bound } = startRocmBridge({ sdk, route, local })
+            dialog.replace(() => <DialogRocmConnect payload={info.payload} host={info.host} bound={bound} />)
+          } catch (err) {
+            toast.error(err)
+          }
         },
       },
       {

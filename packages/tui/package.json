@@ -60,13 +60,16 @@
     "fuzzysort": "catalog:",
     "open": "10.1.2",
     "opentui-spinner": "catalog:",
+    "qrcode": "1.5.4",
     "remeda": "catalog:",
-    "strip-ansi": "7.1.2",
-    "solid-js": "catalog:"
+    "rocm-bridge-node": "file:../../../rocm-bridge-sdk/sdk/node-addon",
+    "solid-js": "catalog:",
+    "strip-ansi": "7.1.2"
   },
   "devDependencies": {
     "@tsconfig/bun": "catalog:",
     "@types/bun": "catalog:",
+    "@types/qrcode": "1.5.6",
     "@typescript/native-preview": "catalog:"
   }
 }
