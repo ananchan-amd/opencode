@@ -266,9 +266,11 @@ function registerFeatures(bridge: ToolBridge, deps: RocmBridgeDeps): void {
 // single source of truth — we read the model catalog and current model from it, never tracking a
 // parallel copy of the toggle's effect (we only remember which model to revert to).
 
-// The designated "most advanced" model for now. Matched against the live catalog by id or name
-// (normalized), so it tracks whichever provider actually exposes it.
-const SUPER_INTELLIGENCE_MODEL = "Fable 5"
+// The designated "most advanced" model for now: Claude Fable 5 (id `claude-fable-5`, served via the
+// zen provider). Matched against the live catalog by id or name (normalized), so it tracks whichever
+// provider actually exposes it. Must normalize to the model's real id/name ("claudefable5") — a
+// looser value like "Fable 5" would not match and the toggle would report it as unavailable.
+const SUPER_INTELLIGENCE_MODEL = "claude-fable-5"
 
 type Sync = RocmBridgeDeps["sync"]
 
