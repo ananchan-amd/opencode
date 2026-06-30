@@ -3,6 +3,7 @@ import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import type { useSDK } from "../../context/sdk"
 import type { useRoute } from "../../context/route"
 import { parseModel, type useLocal } from "../../context/local"
+import type { useSync } from "../../context/sync"
 
 // Integration of the ROCm Bridge SDK so a phone running the mobile client can pair over the LAN
 // and drive opencode. We own only the three wirings the SDK asks for: show the QR (the dialog
@@ -14,6 +15,7 @@ export type RocmBridgeDeps = {
   sdk: ReturnType<typeof useSDK>
   route: ReturnType<typeof useRoute>
   local: ReturnType<typeof useLocal>
+  sync: ReturnType<typeof useSync>
 }
 
 // The shape napi hands a command handler. The generated .d.ts types the callback loosely.
@@ -40,6 +42,9 @@ export function startRocmBridge(deps: RocmBridgeDeps): { info: PairingInfo; boun
   // `rocm.telemetry` is registered automatically by the SDK (real GPU source via rocm-smi where
   // available, mock otherwise) — we only implement our own command, chat.
   registerFeatures(bridge, deps)
+  // `rocm.superintelligence` is the SDK-provided standard feature: the SDK owns the descriptor
+  // (a chat-screen toggle), we supply only the handler that performs opencode's model switch.
+  registerSuperIntelligence(bridge, deps)
 
   const wsPort = port()
   const detail = deps.route.data?.type === "session" ? "session" : "ready"
@@ -251,6 +256,82 @@ function registerFeatures(bridge: ToolBridge, deps: RocmBridgeDeps): void {
   }
   bridge.registerFeature(JSON.stringify(statsDescriptor), (cmd: RocmCommand) => {
     void runStats(deps, cmd)
+  })
+}
+
+// --- Super intelligence (SDK-provided standard feature) ----------------------------------------
+// The SDK owns the `rocm.superintelligence` descriptor (a chat-screen toggle); opencode supplies
+// only this handler. Turning it on switches opencode to its most advanced model; turning it off
+// restores whatever model was selected beforehand. Like the other features, OpenCode stays the
+// single source of truth — we read the model catalog and current model from it, never tracking a
+// parallel copy of the toggle's effect (we only remember which model to revert to).
+
+// The designated "most advanced" model for now. Matched against the live catalog by id or name
+// (normalized), so it tracks whichever provider actually exposes it.
+const SUPER_INTELLIGENCE_MODEL = "Fable 5"
+
+type Sync = RocmBridgeDeps["sync"]
+
+function normalizeModelName(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "")
+}
+
+// Locate the super-intelligence model in the live catalog. Returns undefined if no connected
+// provider exposes it (the handler then surfaces that as an error instead of silently no-op'ing).
+function superIntelligenceModel(sync: Sync): { providerID: string; modelID: string } | undefined {
+  const target = normalizeModelName(SUPER_INTELLIGENCE_MODEL)
+  for (const provider of sync.data.provider) {
+    for (const model of Object.values(provider.models)) {
+      if (normalizeModelName(model.id) === target || normalizeModelName(model.name) === target) {
+        return { providerID: provider.id, modelID: model.id }
+      }
+    }
+  }
+  return undefined
+}
+
+// The model selected before super intelligence was switched on, so toggling off can restore it.
+// This is the handler's own revert memory, not a mirror of feature state — the current model is
+// always re-read from OpenCode.
+let superIntelligencePrevModel: { providerID: string; modelID: string } | undefined
+
+function registerSuperIntelligence(bridge: ToolBridge, deps: RocmBridgeDeps): void {
+  const { sync, local } = deps
+  bridge.registerSuperIntelligence((cmd: RocmCommand) => {
+    const on = cmd.payload.toString("utf8").trim() === "true"
+
+    if (!on) {
+      if (superIntelligencePrevModel) {
+        local.model.set(superIntelligencePrevModel, { recent: true })
+        superIntelligencePrevModel = undefined
+      }
+      pushFeatureState(bridge, local)
+      cmd.reply.data(Buffer.from("super intelligence off", "utf8"))
+      cmd.reply.end()
+      return
+    }
+
+    const target = superIntelligenceModel(sync)
+    if (!target) {
+      cmd.reply.error(`super intelligence model (${SUPER_INTELLIGENCE_MODEL}) is not available`)
+      return
+    }
+
+    const current = local.model.current()
+    if (!current || modelKey(current) !== modelKey(target)) {
+      superIntelligencePrevModel = current
+    }
+    local.model.set(target, { recent: true })
+
+    // Re-read: if OpenCode rejected/normalized the switch, the mirror and the reply reflect reality.
+    const now = local.model.current()
+    if (!now || modelKey(now) !== modelKey(target)) {
+      cmd.reply.error(`super intelligence: could not switch to ${modelKey(target)}`)
+      return
+    }
+    pushFeatureState(bridge, local)
+    cmd.reply.data(Buffer.from("super intelligence on: " + modelKey(target), "utf8"))
+    cmd.reply.end()
   })
 }
 

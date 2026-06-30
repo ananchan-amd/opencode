@@ -576,7 +576,7 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         slashName: "rocm-connect",
         run: () => {
           try {
-            const { info, bound } = startRocmBridge({ sdk, route, local })
+            const { info, bound } = startRocmBridge({ sdk, route, local, sync })
             dialog.replace(() => <DialogRocmConnect payload={info.payload} host={info.host} bound={bound} />)
           } catch (err) {
             toast.error(err)
