@@ -2,7 +2,7 @@ import { ToolBridge, protocolVersion, type PairingInfo } from "rocm-bridge-node"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import type { useSDK } from "../../context/sdk"
 import type { useRoute } from "../../context/route"
-import type { useLocal } from "../../context/local"
+import { parseModel, type useLocal } from "../../context/local"
 
 // Integration of the ROCm Bridge SDK so a phone running the mobile client can pair over the LAN
 // and drive opencode. We own only the three wirings the SDK asks for: show the QR (the dialog
@@ -39,6 +39,7 @@ export function startRocmBridge(deps: RocmBridgeDeps): { info: PairingInfo; boun
   bridge.registerCommand("chat.completion", makeChatHandler(deps))
   // `rocm.telemetry` is registered automatically by the SDK (real GPU source via rocm-smi where
   // available, mock otherwise) — we only implement our own command, chat.
+  registerFeatures(bridge, deps)
 
   const wsPort = port()
   const detail = deps.route.data?.type === "session" ? "session" : "ready"
@@ -163,4 +164,152 @@ async function runChat(deps: RocmBridgeDeps, cmd: RocmCommand): Promise<void> {
       cmd.reply.error(String(err))
     })
   }
+}
+
+// --- Tool features (the "core trio") -----------------------------------------------------------
+// OpenCode is the single source of truth. Every reported value is derived by calling OpenCode's own
+// getters (`local.model.*`, `local.agent.*`, the session message list); the SDK descriptor is only a
+// display mirror. After a phone-driven change we apply it via OpenCode's setter, then re-read the
+// resolved current state and push *that* back — so a rejected/normalized set still mirrors reality.
+
+type Local = RocmBridgeDeps["local"]
+
+function modelKey(m: { providerID: string; modelID: string }): string {
+  return `${m.providerID}/${m.modelID}`
+}
+
+function modelDetail(local: Local): string {
+  const p = local.model.parsed()
+  return `${p.provider} · ${p.model}`
+}
+
+// Static menu: current ∪ recent ∪ favorite, deduped, current first.
+function modelOptions(local: Local): string[] {
+  const current = local.model.current()
+  const all = [...(current ? [current] : []), ...local.model.recent(), ...local.model.favorite()]
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const m of all) {
+    const key = modelKey(m)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(key)
+  }
+  return out
+}
+
+// The one funnel that maps OpenCode's current state → the SDK display mirror.
+function pushFeatureState(bridge: ToolBridge, local: Local): void {
+  const m = local.model.current()
+  if (m) {
+    bridge.updateFeatureState("opencode.model", JSON.stringify({ value: modelKey(m), detail: modelDetail(local) }))
+  }
+  const a = local.agent.current()
+  if (a) {
+    bridge.updateFeatureState("opencode.agent", JSON.stringify({ value: a.name, detail: a.name }))
+  }
+}
+
+function registerFeatures(bridge: ToolBridge, deps: RocmBridgeDeps): void {
+  const { local } = deps
+
+  const currentModel = local.model.current()
+  const modelDescriptor = {
+    id: "opencode.model",
+    label: "Model",
+    group: "Model",
+    detail: modelDetail(local),
+    control: { kind: "select", options: modelOptions(local), value: currentModel ? modelKey(currentModel) : null },
+  }
+  bridge.registerFeature(JSON.stringify(modelDescriptor), (cmd: RocmCommand) => {
+    local.model.set(parseModel(cmd.payload.toString("utf8")), { recent: true })
+    pushFeatureState(bridge, local)
+    cmd.reply.data(Buffer.from("model set", "utf8"))
+    cmd.reply.end()
+  })
+
+  const currentAgent = local.agent.current()
+  const agentDescriptor = {
+    id: "opencode.agent",
+    label: "Active agent",
+    group: "Agent",
+    detail: currentAgent?.name,
+    control: { kind: "select", options: local.agent.list().map((a) => a.name), value: currentAgent?.name ?? null },
+  }
+  bridge.registerFeature(JSON.stringify(agentDescriptor), (cmd: RocmCommand) => {
+    local.agent.set(cmd.payload.toString("utf8"))
+    pushFeatureState(bridge, local)
+    cmd.reply.data(Buffer.from("agent set", "utf8"))
+    cmd.reply.end()
+  })
+
+  const statsDescriptor = {
+    id: "opencode.stats",
+    label: "Session stats",
+    group: "Stats",
+    control: { kind: "info" },
+  }
+  bridge.registerFeature(JSON.stringify(statsDescriptor), (cmd: RocmCommand) => {
+    void runStats(deps, cmd)
+  })
+}
+
+function formatTokens(n: number): { value: string; unit?: string } {
+  if (n >= 1000) return { value: (n / 1000).toFixed(1), unit: "k" }
+  return { value: String(n) }
+}
+
+// `info` handler: read the live session every time (no mirror). Sums assistant cost and reports the
+// latest assistant message's context-token total, mirroring OpenCode's own sidebar computation.
+async function runStats(deps: RocmBridgeDeps, cmd: RocmCommand): Promise<void> {
+  const { sdk, route } = deps
+  const current = route.data
+
+  if (!(current?.type === "session" && typeof current.sessionID === "string")) {
+    cmd.reply.data(Buffer.from(JSON.stringify({ items: [{ label: "session", value: "none" }] }), "utf8"))
+    cmd.reply.end()
+    return
+  }
+
+  const sessionID = current.sessionID
+  try {
+    const result = await sdk.client.v2.session.messages({ sessionID }, { throwOnError: true })
+    const messages = (result.data as { data: Array<{ type: string; cost?: number; tokens?: AssistantTokens }> }).data
+
+    let cost = 0
+    let assistantCount = 0
+    for (const m of messages) {
+      if (m.type !== "assistant") continue
+      assistantCount++
+      if (typeof m.cost === "number") cost += m.cost
+    }
+
+    let tokens = 0
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]
+      if (m.type === "assistant" && m.tokens && m.tokens.output > 0) {
+        const t = m.tokens
+        tokens = t.input + t.output + t.reasoning + t.cache.read + t.cache.write
+        break
+      }
+    }
+
+    const tok = formatTokens(tokens)
+    const items = [
+      { label: "context", value: tok.value, unit: tok.unit },
+      { label: "cost", value: "$" + cost.toFixed(2) },
+      { label: "messages", value: String(assistantCount) },
+    ]
+    cmd.reply.data(Buffer.from(JSON.stringify({ items }), "utf8"))
+    cmd.reply.end()
+  } catch (err) {
+    cmd.reply.error("failed to read session stats: " + String(err))
+  }
+}
+
+type AssistantTokens = {
+  input: number
+  output: number
+  reasoning: number
+  cache: { read: number; write: number }
 }
