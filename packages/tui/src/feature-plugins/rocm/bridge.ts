@@ -2,7 +2,8 @@ import { ToolBridge, protocolVersion, type PairingInfo } from "rocm-bridge-node"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import type { useSDK } from "../../context/sdk"
 import type { useRoute } from "../../context/route"
-import type { useLocal } from "../../context/local"
+import { parseModel, type useLocal } from "../../context/local"
+import type { useSync } from "../../context/sync"
 
 // Integration of the ROCm Bridge SDK so a phone running the mobile client can pair over the LAN
 // and drive opencode. We own only the three wirings the SDK asks for: show the QR (the dialog
@@ -14,6 +15,7 @@ export type RocmBridgeDeps = {
   sdk: ReturnType<typeof useSDK>
   route: ReturnType<typeof useRoute>
   local: ReturnType<typeof useLocal>
+  sync: ReturnType<typeof useSync>
 }
 
 // The shape napi hands a command handler. The generated .d.ts types the callback loosely.
@@ -39,6 +41,10 @@ export function startRocmBridge(deps: RocmBridgeDeps): { info: PairingInfo; boun
   bridge.registerCommand("chat.completion", makeChatHandler(deps))
   // `rocm.telemetry` is registered automatically by the SDK (real GPU source via rocm-smi where
   // available, mock otherwise) — we only implement our own command, chat.
+  registerFeatures(bridge, deps)
+  // `rocm.superintelligence` is the SDK-provided standard feature: the SDK owns the descriptor
+  // (a chat-screen toggle), we supply only the handler that performs opencode's model switch.
+  registerSuperIntelligence(bridge, deps)
 
   const wsPort = port()
   const detail = deps.route.data?.type === "session" ? "session" : "ready"
@@ -163,4 +169,230 @@ async function runChat(deps: RocmBridgeDeps, cmd: RocmCommand): Promise<void> {
       cmd.reply.error(String(err))
     })
   }
+}
+
+// --- Tool features (the "core trio") -----------------------------------------------------------
+// OpenCode is the single source of truth. Every reported value is derived by calling OpenCode's own
+// getters (`local.model.*`, `local.agent.*`, the session message list); the SDK descriptor is only a
+// display mirror. After a phone-driven change we apply it via OpenCode's setter, then re-read the
+// resolved current state and push *that* back — so a rejected/normalized set still mirrors reality.
+
+type Local = RocmBridgeDeps["local"]
+
+function modelKey(m: { providerID: string; modelID: string }): string {
+  return `${m.providerID}/${m.modelID}`
+}
+
+function modelDetail(local: Local): string {
+  const p = local.model.parsed()
+  return `${p.provider} · ${p.model}`
+}
+
+// Static menu: current ∪ recent ∪ favorite, deduped, current first.
+function modelOptions(local: Local): string[] {
+  const current = local.model.current()
+  const all = [...(current ? [current] : []), ...local.model.recent(), ...local.model.favorite()]
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const m of all) {
+    const key = modelKey(m)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(key)
+  }
+  return out
+}
+
+// The one funnel that maps OpenCode's current state → the SDK display mirror.
+function pushFeatureState(bridge: ToolBridge, local: Local): void {
+  const m = local.model.current()
+  if (m) {
+    bridge.updateFeatureState("opencode.model", JSON.stringify({ value: modelKey(m), detail: modelDetail(local) }))
+  }
+  const a = local.agent.current()
+  if (a) {
+    bridge.updateFeatureState("opencode.agent", JSON.stringify({ value: a.name, detail: a.name }))
+  }
+}
+
+function registerFeatures(bridge: ToolBridge, deps: RocmBridgeDeps): void {
+  const { local } = deps
+
+  const currentModel = local.model.current()
+  const modelDescriptor = {
+    id: "opencode.model",
+    label: "Model",
+    group: "Model",
+    detail: modelDetail(local),
+    control: { kind: "select", options: modelOptions(local), value: currentModel ? modelKey(currentModel) : null },
+  }
+  bridge.registerFeature(JSON.stringify(modelDescriptor), (cmd: RocmCommand) => {
+    local.model.set(parseModel(cmd.payload.toString("utf8")), { recent: true })
+    pushFeatureState(bridge, local)
+    cmd.reply.data(Buffer.from("model set", "utf8"))
+    cmd.reply.end()
+  })
+
+  const currentAgent = local.agent.current()
+  const agentDescriptor = {
+    id: "opencode.agent",
+    label: "Active agent",
+    group: "Agent",
+    detail: currentAgent?.name,
+    control: { kind: "select", options: local.agent.list().map((a) => a.name), value: currentAgent?.name ?? null },
+  }
+  bridge.registerFeature(JSON.stringify(agentDescriptor), (cmd: RocmCommand) => {
+    local.agent.set(cmd.payload.toString("utf8"))
+    pushFeatureState(bridge, local)
+    cmd.reply.data(Buffer.from("agent set", "utf8"))
+    cmd.reply.end()
+  })
+
+  const statsDescriptor = {
+    id: "opencode.stats",
+    label: "Session stats",
+    group: "Stats",
+    control: { kind: "info" },
+  }
+  bridge.registerFeature(JSON.stringify(statsDescriptor), (cmd: RocmCommand) => {
+    void runStats(deps, cmd)
+  })
+}
+
+// --- Super intelligence (SDK-provided standard feature) ----------------------------------------
+// The SDK owns the `rocm.superintelligence` descriptor (a chat-screen toggle); opencode supplies
+// only this handler. Turning it on switches opencode to its most advanced model; turning it off
+// restores whatever model was selected beforehand. Like the other features, OpenCode stays the
+// single source of truth — we read the model catalog and current model from it, never tracking a
+// parallel copy of the toggle's effect (we only remember which model to revert to).
+
+// The designated "most advanced" model for now: Claude Fable 5 (id `claude-fable-5`, served via the
+// zen provider). Matched against the live catalog by id or name (normalized), so it tracks whichever
+// provider actually exposes it. Must normalize to the model's real id/name ("claudefable5") — a
+// looser value like "Fable 5" would not match and the toggle would report it as unavailable.
+const SUPER_INTELLIGENCE_MODEL = "claude-fable-5"
+
+type Sync = RocmBridgeDeps["sync"]
+
+function normalizeModelName(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "")
+}
+
+// Locate the super-intelligence model in the live catalog. Returns undefined if no connected
+// provider exposes it (the handler then surfaces that as an error instead of silently no-op'ing).
+function superIntelligenceModel(sync: Sync): { providerID: string; modelID: string } | undefined {
+  const target = normalizeModelName(SUPER_INTELLIGENCE_MODEL)
+  for (const provider of sync.data.provider) {
+    for (const model of Object.values(provider.models)) {
+      if (normalizeModelName(model.id) === target || normalizeModelName(model.name) === target) {
+        return { providerID: provider.id, modelID: model.id }
+      }
+    }
+  }
+  return undefined
+}
+
+// The model selected before super intelligence was switched on, so toggling off can restore it.
+// This is the handler's own revert memory, not a mirror of feature state — the current model is
+// always re-read from OpenCode.
+let superIntelligencePrevModel: { providerID: string; modelID: string } | undefined
+
+function registerSuperIntelligence(bridge: ToolBridge, deps: RocmBridgeDeps): void {
+  const { sync, local } = deps
+  bridge.registerSuperIntelligence((cmd: RocmCommand) => {
+    const on = cmd.payload.toString("utf8").trim() === "true"
+
+    if (!on) {
+      if (superIntelligencePrevModel) {
+        local.model.set(superIntelligencePrevModel, { recent: true })
+        superIntelligencePrevModel = undefined
+      }
+      pushFeatureState(bridge, local)
+      cmd.reply.data(Buffer.from("super intelligence off", "utf8"))
+      cmd.reply.end()
+      return
+    }
+
+    const target = superIntelligenceModel(sync)
+    if (!target) {
+      cmd.reply.error(`super intelligence model (${SUPER_INTELLIGENCE_MODEL}) is not available`)
+      return
+    }
+
+    const current = local.model.current()
+    if (!current || modelKey(current) !== modelKey(target)) {
+      superIntelligencePrevModel = current
+    }
+    local.model.set(target, { recent: true })
+
+    // Re-read: if OpenCode rejected/normalized the switch, the mirror and the reply reflect reality.
+    const now = local.model.current()
+    if (!now || modelKey(now) !== modelKey(target)) {
+      cmd.reply.error(`super intelligence: could not switch to ${modelKey(target)}`)
+      return
+    }
+    pushFeatureState(bridge, local)
+    cmd.reply.data(Buffer.from("super intelligence on: " + modelKey(target), "utf8"))
+    cmd.reply.end()
+  })
+}
+
+function formatTokens(n: number): { value: string; unit?: string } {
+  if (n >= 1000) return { value: (n / 1000).toFixed(1), unit: "k" }
+  return { value: String(n) }
+}
+
+// `info` handler: read the live session every time (no mirror). Sums assistant cost and reports the
+// latest assistant message's context-token total, mirroring OpenCode's own sidebar computation.
+async function runStats(deps: RocmBridgeDeps, cmd: RocmCommand): Promise<void> {
+  const { sdk, route } = deps
+  const current = route.data
+
+  if (!(current?.type === "session" && typeof current.sessionID === "string")) {
+    cmd.reply.data(Buffer.from(JSON.stringify({ items: [{ label: "session", value: "none" }] }), "utf8"))
+    cmd.reply.end()
+    return
+  }
+
+  const sessionID = current.sessionID
+  try {
+    const result = await sdk.client.v2.session.messages({ sessionID }, { throwOnError: true })
+    const messages = (result.data as { data: Array<{ type: string; cost?: number; tokens?: AssistantTokens }> }).data
+
+    let cost = 0
+    let assistantCount = 0
+    for (const m of messages) {
+      if (m.type !== "assistant") continue
+      assistantCount++
+      if (typeof m.cost === "number") cost += m.cost
+    }
+
+    let tokens = 0
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]
+      if (m.type === "assistant" && m.tokens && m.tokens.output > 0) {
+        const t = m.tokens
+        tokens = t.input + t.output + t.reasoning + t.cache.read + t.cache.write
+        break
+      }
+    }
+
+    const tok = formatTokens(tokens)
+    const items = [
+      { label: "context", value: tok.value, unit: tok.unit },
+      { label: "cost", value: "$" + cost.toFixed(2) },
+      { label: "messages", value: String(assistantCount) },
+    ]
+    cmd.reply.data(Buffer.from(JSON.stringify({ items }), "utf8"))
+    cmd.reply.end()
+  } catch (err) {
+    cmd.reply.error("failed to read session stats: " + String(err))
+  }
+}
+
+type AssistantTokens = {
+  input: number
+  output: number
+  reasoning: number
+  cache: { read: number; write: number }
 }
